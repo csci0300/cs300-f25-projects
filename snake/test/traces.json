@@ -123,7 +123,7 @@
     "description": "Once game_over is set, the update function should not do anything",
     "seed": "0",
     "snake_grows": "0",
-    "key_input": "UNNNNNNNNNNNNRRRRRNN",
+    "key_input": "NNNNNNNNNNNNNNNNNNNNN",
     "output": {
       "game_over": 1,
       "score": 0,
@@ -131,8 +131,8 @@
       "height": 10,
       "cells": [
         "XXXXXXXXXXXXXXXXXXXX",
-        "XGsGGGGGGGGGGGGGGGGX",
-        "XG................GX",
+        "XGGGGGGGGGGGGGGGGGGX",
+        "XG................sX",
         "XG................GX",
         "XG....?...........GX",
         "XG................GX",
