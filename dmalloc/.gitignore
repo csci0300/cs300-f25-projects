@@ -1,0 +1,19 @@
+# IDE setup files
+.vscode
+*.idea/*
+
+# ignore compiled object files 
+*.o
+test*
+!test*.cc
+hhtest
+hhtest.o
+.deps/*
+
+# also ignore macOS metadata files
+.DS_Store
+
+# Autosave files
+*~
+\#*#
+.\#*
