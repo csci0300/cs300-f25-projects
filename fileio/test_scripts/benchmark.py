@@ -4,6 +4,7 @@ import re
 import os
 import sys
 import json
+import signal
 import pathlib
 import argparse
 import tempfile
@@ -29,8 +30,12 @@ BOLD = "\033[1m"
 UNDERLINE = "\033[4m"
 
 
-TIMEOUT_SEC = 120
+TIMEOUT_SEC = 15
 GRADER_MODE = False
+
+# PGID of running test program
+RUNNING_PGID = None
+
 
 log_lines = []
 
@@ -100,29 +105,36 @@ def _get_usec(d: datetime.timedelta):
 
 def time_program(progcmd):
     global TIMEOUT_SEC
+    global RUNNING_PGID
 
     timeout_arg = TIMEOUT_SEC if TIMEOUT_SEC > 0 else None
 
     sp = None
     failed = False
+    cmd = ['/usr/bin/time', '--verbose', '--'] + progcmd.split(' ')
+    proc = subprocess.Popen(cmd,
+                            stdout=subprocess.PIPE,
+                            stderr=subprocess.PIPE,
+                            preexec_fn=os.setpgrp)
+
+    RUNNING_PGID = os.getpgid(proc.pid)
+    stdout, stderr = bytes(), bytes()
     try:
-        sp = subprocess.run(
-            ['/usr/bin/time', '--verbose', '--'] + progcmd.split(' '),
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            timeout=timeout_arg,
-        )
+        stdout, stderr = proc.communicate(timeout=timeout_arg)
     except subprocess.TimeoutExpired:
-        log(FAIL + f"timed out after {TIMEOUT_SEC} seconds" + ENDC)
+        proc.kill()
+        os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
+        #log(FAIL + f"timed out after {TIMEOUT_SEC} seconds" + ENDC)
         failed = True
 
-    if failed or sp.returncode != 0:
+    returncode = proc.returncode
+    if failed or returncode != 0:
         if sp is not None:
-            log(str(sp.stdout, encoding='utf-8', errors="backslashreplace"))
-            log(str(sp.stderr, encoding='utf-8', errors="backslashreplace"))
+            log(str(stdout, encoding='utf-8', errors="backslashreplace"))
+            log(str(stderr, encoding='utf-8', errors="backslashreplace"))
         return None
 
-    time_output = str(sp.stderr)
+    time_output = str(stderr)
 
     perf_data = {
         'cpu': get_time_field(time_output, 'Percent of CPU this job got:'),
@@ -159,58 +171,6 @@ def parse_size(size):
     return int(float(number)*units[unit[0]])
 
 
-def time_program_dt(progcmd):
-    global TIMEOUT_SEC
-
-    timeout_arg = TIMEOUT_SEC if TIMEOUT_SEC > 0 else None
-
-    sp = None
-    failed = False
-    time_start = None
-    time_end = None
-
-    try:
-        time_start = datetime.datetime.now()
-        sp = subprocess.run(
-            ['/usr/bin/time', '--verbose', '--'] + progcmd.split(' '),
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            timeout=timeout_arg,
-        )
-        time_end = datetime.datetime.now()
-    except subprocess.TimeoutExpired:
-        log(FAIL + f"timed out after {TIMEOUT_SEC} seconds" + ENDC)
-        failed = True
-
-    if failed or sp.returncode != 0:
-        if sp is not None:
-            log(str(sp.stdout, encoding='utf-8', errors="backslashreplace"))
-            log(str(sp.stderr, encoding='utf-8', errors="backslashreplace"))
-        return None
-
-    assert(time_start is not None)
-    assert(time_end is not None)
-    t_diff = (time_end - time_start)
-    t_usec = _get_usec(t_diff)
-
-    time_output = str(sp.stderr)
-
-    perf_data = {
-        'cpu': get_time_field(time_output, 'Percent of CPU this job got:'),
-        'stime': get_time_field(time_output, 'System time (seconds):'),
-        'utime': get_time_field(time_output, 'User time (seconds):'),
-        'wtime': get_time_field(time_output, 'Elapsed (wall clock) time (h:mm:ss or m:ss):'),
-        'mrss': get_time_field(time_output, 'Maximum resident set size (kbytes):'),
-        'arss': get_time_field(time_output, 'Average resident set size (kbytes):'),
-        "usec": t_usec,
-    }
-
-    if None in perf_data.values():
-        # we couldn't parse the output, so the command probably failed
-        return None
-    else:
-        return perf_data
-
 def byte_cat(infile, outfile):
     return f'./byte_cat {infile} {outfile}'
 
@@ -240,41 +200,58 @@ def _run_benchmark(prefix, run_func, file_size):
     silent_shell(f"rm -f {infile} {outfile}")
     silent_shell(f'dd if=/dev/urandom of={infile} bs={file_size} count=1')
 
-    perf_results = time_program_dt(run_func(infile, outfile))
+    perf_results = time_program(run_func(infile, outfile))
     silent_shell(f"rm -f {infile} {outfile}")
 
     return perf_results
 
 
-def do_run(uname: str, impl: str, prefix: str):
+TIMEOUT_STR = "[timed out]"
+SKIPPED_STR = "[skipped]"
+
+def do_run(uname: str, impl: str, prefix: str, trials=1):
     global TIMEOUT_SEC
+    global TMPFS_PREFIX
+
+    def _signit_handler(sig, frame):
+        global RUNNING_PGID
+        if RUNNING_PGID is not None:
+            log(f"Ending currently running test (PGID {RUNNING_PGID})...")
+            os.killpg(RUNNING_PGID, signal.SIGTERM)
+
+        raise KeyboardInterrupt
+
+    def _fs_string(s):
+        return "tmpfs" if s == TMPFS_PREFIX else "base"
+
 
     silent_shell("make clean")
     silent_shell('CFLAGS=-DCACHE_SIZE=4096 make -B IMPL={}'.format(impl), echo=True)
 
-    size_min = 1 * 1024 * 1024
-    size_max = 256 * 1024 * 1024
+    size_min = 0.5 * 1024 * 1024
+    size_max = 32 * 1024 * 1024
     size_inc = lambda x: x * 2
+    sizes_mb = [0.5, 1, 4, 8, 16, 32]
+    sizes_bytes = [int(x * (1024 * 1024)) for x in sizes_mb]
 
     benchmarks = {
         'byte_cat': byte_cat,
-        #'diabolical_byte_cat': diabolical_byte_cat,
         'reverse_byte_cat': reverse_byte_cat,
         'block_cat': block_cat,
         'reverse_block_cat': reverse_block_cat,
-        'random_block_cat': random_block_cat,
+        #'random_block_cat': random_block_cat,
         'stride_cat': stride_cat,
-        '_no_op': lambda inf, outf: f'/bin/true',
     }
 
     results = []
+    skip = set()
 
-    curr_size = int(size_min)
-    while curr_size <= size_max:
+    #curr_size = int(size_min)
+    for curr_size in sizes_bytes:
         size_mb = curr_size / (1024 * 1024)
         size_key = "{}M".format(size_mb)
         res_this_size = {
-            "prefix": prefix,
+            "prefix": _fs_string(prefix),
             "uname": uname,
             "impl": impl,
             "size": curr_size,
@@ -283,26 +260,47 @@ def do_run(uname: str, impl: str, prefix: str):
 
         b_results = []
         for name, func in benchmarks.items():
-            print("Running {}:{}:{}:{}M".format(prefix, impl, name, size_mb), end="")
+            print("\nRunning benchmark {}:{}:{}:{}M => ".format(_fs_string(prefix), impl, name, size_mb), end="")
             sys.stdout.flush()
 
-            runtime = _run_benchmark(prefix, func, curr_size)
-            res: dict = {
-                "benchmark": name,
-            }
-            res["t_shell"] = runtime["wtime"] if runtime is not None else float(TIMEOUT_SEC)
-            res["t_usec"] = runtime["usec"] if runtime is not None else int(TIMEOUT_SEC * 1e6)
+            if name in skip:
+                print(SKIPPED_STR)
+                continue
 
-            b_results.append(res)
-            if runtime is None:
-                print("=> TIMED OUT")
-            else:
-                runtime_shell_sec = runtime["wtime"]
-                runtime_dt_sec = float(runtime["usec"]) / 1e6
-                stats = "=> {:.3f}s, {:.3f}s".format(runtime_shell_sec, runtime_dt_sec)
-                print("{:>35}".format(stats))
+            times_this_benchmark = []
+            for t in range(0, trials):
+                signal.signal(signal.SIGINT, _signit_handler)
 
-        curr_size = size_inc(curr_size)
+                runtime = _run_benchmark(prefix, func, curr_size)
+
+                signal.signal(signal.SIGINT, signal.SIG_DFL)
+
+                res: dict = {
+                    "trial": t,
+                    "benchmark": name,
+                }
+
+                t_run = runtime["wtime"] if runtime is not None else TIMEOUT_STR
+
+                times_this_benchmark.append(t_run)
+                res["time"] = t_run
+
+                b_results.append(res)
+                if runtime is None:
+                    stats = "[timed out] "
+                else:
+                    runtime_shell_sec = runtime["wtime"]
+                    stats = "{:.3f}s ".format(runtime_shell_sec)
+
+                print(stats, end="")
+                sys.stdout.flush()
+
+            if all([x is TIMEOUT_STR for x in times_this_benchmark]):
+                print(f"\nAll trials of {name} timed out, skipping for the rest of this batch")
+                skip.add(name)
+
+        #curr_size = size_inc(curr_size)
+        print("")
 
         res_this_size["tests"] = b_results
         results.append(res_this_size)
@@ -316,7 +314,7 @@ IMPLS = [
 ]
 
 
-TMPFS_PREFIX = "/tmp/tmp"
+TMPFS_PREFIX = "/tmp/io300_benchmark"
 
 PREFIXES = [
     "/tmp",
@@ -324,11 +322,12 @@ PREFIXES = [
 ]
 
 
+
 def _do_setup_tmpfs():
     chk = subprocess.check_output("mount | grep {} || true".format(TMPFS_PREFIX), shell=True, text=True)
     if "tmpfs" in chk:
         print("tmpfs found, not creating mount point")
-        return
+        return True
 
     def _run(cmd):
         print("-> {}", cmd)
@@ -339,16 +338,20 @@ def _do_setup_tmpfs():
 
     _chk = subprocess.check_output("mount | grep {} || true".format(TMPFS_PREFIX), shell=True, text=True)
     if "tmpfs" not in _chk:
-        import pdb; pdb.set_trace()
-        raise OSError("Unable to set up tmpfs")
+        return False
+    else:
+        return True
 
+
+DEFAULT_TRIALS = 3
 def main(input_args):
     global TIMEOUT_SEC
 
     parser = argparse.ArgumentParser()
     parser.add_argument("--timeout", type=int, default=TIMEOUT_SEC)
-    parser.add_argument("--output-file", default=None)
-    parser.add_argument("key")
+    parser.add_argument("--trials", type=int, default=DEFAULT_TRIALS)
+    parser.add_argument("--output-file", default="benchmark.json")
+    parser.add_argument("--key", type=str, default=None)
 
     args = parser.parse_args(input_args)
 
@@ -364,19 +367,26 @@ def main(input_args):
     if args.timeout:
         TIMEOUT_SEC = args.timeout
 
-    _do_setup_tmpfs()
+    tmpfs_ok = _do_setup_tmpfs()
+    if (not tmpfs_ok):
+        print("tmpfs setup failed, skipping tmpfs benchmarks")
 
     json_out = {
         "uname": uname,
-        "key": key,
         "timeout_usec": int(TIMEOUT_SEC * 1e6),
         "results": [],
     }
 
+    if key:
+        json_out["key"] = key
+
     results = []
     for prefix in PREFIXES:
         for impl in IMPLS:
-            impl_results = do_run(uname, impl, prefix)
+            if prefix == TMPFS_PREFIX and (not tmpfs_ok):
+                continue
+
+            impl_results = do_run(uname, impl, prefix, trials=args.trials)
             results.extend(impl_results)
 
     json_out["results"] = results
@@ -387,7 +397,7 @@ def main(input_args):
         json.dump(json_out, fd,
                   indent=True, sort_keys=False)
 
-    print("Wrote {}".format(output_file))
+    print("Done!  Output written to {}".format(output_file))
 
 if __name__ == "__main__":
     sys.exit(main(sys.argv[1:]))

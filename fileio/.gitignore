@@ -26,6 +26,8 @@ test_programs/reference/reverse
 test_programs/reference/stride
 test_programs/reference/rot13
 
+benchmark.json
+
 *.pyc
 __pycache__/
 
